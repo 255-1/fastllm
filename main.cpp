@@ -25,6 +25,8 @@ struct RunConfig {
     int groupCnt = -1;
 };
 
+//模型运行参数，平时主要用到的是-p,top_p,top_k,--temperature和--repeat_penalty
+//其他的比如dtype, atype之类的都不是离线flm需要用的
 void Usage() {
     std::cout << "Usage:" << std::endl;
     std::cout << "[-h|--help]:                  显示帮助" << std::endl;
@@ -92,36 +94,48 @@ void ParseArgs(int argc, char **argv, RunConfig &config, fastllm::GenerationConf
 }
 
 int main(int argc, char **argv) {
-#ifdef _WIN32
-    system("chcp 65001");
-#endif
+    //解析运行参数
     RunConfig config;
     fastllm::GenerationConfig generationConfig;
     ParseArgs(argc, argv, config, generationConfig);
-
+    //打印PC支持哪些SIMD指令
     fastllm::PrintInstructionInfo();
+    //设定线程状态，在一些情况下会使用多线程
+    //使用cpu的算子会将矩阵进行切分，分配到不同的线程计算
+    //在线量化模型
     fastllm::SetThreads(config.threads);
+    //低内存状态，使用mmap共享代替直接分配
     fastllm::SetLowMemMode(config.lowMemMode);
     if (!fastllm::FileExists(config.path)) {
         printf(u8"模型文件 %s 不存在！\n", config.path.c_str());
         exit(0);
     }
+    //支持两种读取模型，一种是读取转换好的flm离线模型。另一种是读取huggingface文件夹，目前只支持safetensor格式
+    //从huggingface读取流程一样，它会用到多线程处理数据，相比离线方法能提供更多的转换种类如下，但是不会保存模型
+    // enum DataType {
+    // FLOAT32 = 0, BFLOAT16 = 1, INT16 = 2, INT8 = 3, INT4 = 4, INT2 = 5, BIT = 6, FLOAT16 = 7,
+    // INT4_NOZERO = 8, INT4_GROUP = 9, INT32PARAM = 100,
+    // DATA_AUTO_NONE = 99999, DATA_AUTO_LINEAR, DATA_AUTO_EMBEDDING, DATA_AUTO_CONV
+    // };
+    //我们主要讲解从已经转换好的qwen2 int4g的flm模型读取的过程，即CreateLLMModelFromFile这个函数，流程都大差不差
     bool isHFDir = fastllm::FileExists(config.path + "/config.json") || fastllm::FileExists(config.path + "config.json");
     auto model = !isHFDir ? fastllm::CreateLLMModelFromFile(config.path) : fastllm::CreateLLMModelFromHF(config.path, config.dtype, config.groupCnt);
+    //下面这些设置基本上都是为了huggingface文件夹读取做的，atype，eos_token，prompt在之前的torch2file函数中都完成了
     if (config.atype != fastllm::DataType::FLOAT32) {
         model->SetDataType(config.atype);
     }
     model->SetSaveHistoryChat(true);
-    
+    //eosToken的设置是离线做不到的，torch2file中识别出模型后是硬编码，并且不支持多个eos_token_id
+    //qwen系列的generation_config.json中的eos_token_id有两个，但是都是硬编码成第一个，而在线转换中可以插入多个eosToken
     for (auto &it : config.eosToken) {
         generationConfig.stop_token_ids.insert(model->weight.tokenizer.GetTokenId(it));
     }
     std::string systemConfig = config.systemPrompt;
     fastllm::ChatMessages messages = {{"system", systemConfig}};
-
+    //获取模型类型，并开始和用户交互
     static std::string modelType = model->model_type;
     printf(u8"欢迎使用 %s 模型. 输入内容对话，reset清空历史记录，stop退出程序.\n", model->model_type.c_str());
-
+    //读取用户输入，然后使用model->Response函数进行回答，直到输入stop结束交互
     while (true) {
         printf(u8"用户: ");
         std::string input;
@@ -134,6 +148,7 @@ int main(int argc, char **argv) {
             break;
         }
         messages.push_back(std::make_pair("user", input));
+        //回复
         std::string ret = model->Response(model->ApplyChatTemplate(messages), [](int index, const char* content) {
             if (index == 0) {
                 printf("%s:%s", modelType.c_str(), content);

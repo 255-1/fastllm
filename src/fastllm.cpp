@@ -1967,13 +1967,18 @@ namespace fastllm {
 
     void WeightMap::LoadFromFile(const std::string &fileName) {
 #ifdef USE_MMAP
+        //使用mmap，需要FileMmap类来记录，FileMmap包括两个元素，指针 char*和数据大小 size
         std::shared_ptr<FileMmap> mapped_file = std::make_shared<FileMmap>(fileName);
+        //ModelLoader
         ModelLoader buffer((char *)mapped_file->data, mapped_file->size);
 #else
         FileBuffer buffer(fileName);
 #endif
         this->versionId = buffer.ReadInt();
 
+        //flm文件按照顺序包含三个部分，modelInfo, vocab词表，以及模型权重
+        //所有的读取流程都是先知道要读的数量，然后使用for循环读出来
+        //下面这一块读取modelInfo，可以得到模型所有信息
         if (this->versionId >= 1) {
             // versionId >= 1, 前置了一个key-value表
             int keyValueLen = buffer.ReadInt();
@@ -1984,7 +1989,7 @@ namespace fastllm {
                 this->dicts[key] = value;
             }
         }
-
+        //我们没有对模型做过微调
         if (this->dicts.find("peft_size") != this->dicts.end()) {
             int peftSize = atoi(this->dicts["peft_size"].c_str());
             for (int i = 0; i < peftSize; i++) {
@@ -2000,9 +2005,10 @@ namespace fastllm {
                 }
             }
         }
-
+        //qwen2转换时使用了merge字典进行score计算
         bool useScore = this->dicts.find("tokenizer_use_score") != this->dicts.end()
                 && this->dicts["tokenizer_use_score"] == "1";
+        //读取vocab词表，并且将score读出
         int vocabLen = buffer.ReadInt();
         for (int i = 0; i < vocabLen; i++) {
             int len = buffer.ReadInt();
@@ -2014,6 +2020,7 @@ namespace fastllm {
             float score = useScore ? buffer.ReadFloat() : -i;
             tokenizer.Insert(x, id, score);
         }
+        //下面读取特殊token，bos_token_id，eos_token_id等
         bool hasSpecialTokens = this->dicts.find("tokenizer_has_special_tokens") != this->dicts.end()
                 && this->dicts["tokenizer_has_special_tokens"] == "1";
         if (hasSpecialTokens) {
@@ -2028,23 +2035,26 @@ namespace fastllm {
         }
         if (this->dicts.find("chat_template") != this->dicts.end())
             tokenizer.chatTemplate = this->dicts["chat_template"];
-
+        
+        //读取权重，顺序和torch2file中写入的顺序一致
         int len = buffer.ReadInt();
         for (int i = 0; i < len; i++) {
+            //读取权重名字
             std::string name = buffer.ReadString();
-            //printf("%s\n", name.c_str());
+            //读取维度信息，weight一般2个维度，bias一般1个维度
             int dimsSize = buffer.ReadInt();
-            //printf("size = %d\n", dimsSize);
             std::vector <int> dims;
             for (int j = 0; j < dimsSize; j++) {
                 int x = buffer.ReadInt();
                 dims.push_back(x);
-                //printf("%d\n", x);
             }
+            //读取数据类型，以qwen2使用int4g为例
+            //xxx.weight使用INT4_GROUP量化， xxx.bias和embedding使用FLOAT32，
             DataType dataType = (DataType)buffer.ReadInt();
             weight[name] = Data(dataType, dims);
             weight[name].name = name;
 
+            //使用lowMemMode, 不把权重载入内存，而是记录flm文件中权重的位置
             if (lowMemMode && this->embeddingNames.find(name) != this->embeddingNames.end()) {
                 if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
                     weight[name].fileName = fileName;
@@ -2060,6 +2070,7 @@ namespace fastllm {
 #ifdef USE_MMAP
                     buffer.seek(weight[name].GetBytes(), SEEK_CUR);
 #else
+// fseek记录相对位置
                     fseek(buffer.f, weight[name].GetBytes(), SEEK_CUR);
 #endif
                 } else {
@@ -2070,8 +2081,10 @@ namespace fastllm {
                 weight[name].SetMapFile(mapped_file);
                 weight[name].expansionBytes = (weight[name].Count(0) * weight[name].unitSize - 1) / weight[name].unitSizeDiv + 1;
 #else
+                //根据之前的读取的维度知道要分配多少空间，核心就是给weight的cpuData成员new int[]来存放数据
                 weight[name].Allocate();
 #endif
+                //根据不同数据类型读取，embedding和bias会走到这里面
                 if (dataType == DataType::FLOAT32 || dataType == DataType::BFLOAT16 || dataType == DataType::FLOAT16) {
 #ifdef USE_MMAP
                     weight[name].cpuData = buffer.ReadBytes(weight[name].GetBytes());
@@ -2117,27 +2130,35 @@ namespace fastllm {
                     buffer.ReadBytes(weight[name].cpuData, weight[name].GetBytes());
 #endif
                 } else if (dataType == DataType::INT4_GROUP) {
+                    //int4g量化的权重在这里处理, 下面以qwen2的layers.0.self_attn.q_proj.weight为例
+                    //回忆一下在torch2file中我们将[h, h]矩阵分成128个一组->[h*h/128, 128]进行量化
+                    //我们可以通过 floatValue = min + uint4Value * scale这个公式将量化数据还原
+                    //curWeight.dims:[3584, 3584]
                     auto &curWeight = weight[name];
                     int bit = 4;
-                    curWeight.perChannelAxis = buffer.ReadInt();
-                    curWeight.group = buffer.ReadInt();
-                    curWeight.groupCnt = buffer.ReadInt();
-                    int k = curWeight.perChannelAxis == -1 ? 1 : dims[curWeight.perChannelAxis];
-                    k *= curWeight.group;
-                    curWeight.perChannelsConfigs.resize(k);
+                    curWeight.perChannelAxis = buffer.ReadInt();//0，我们当时对0维做量化
+                    curWeight.group = buffer.ReadInt();         //28，分成28组
+                    curWeight.groupCnt = buffer.ReadInt();      //128，torch2file中的默认值，每128个为一组
+                    int k = curWeight.perChannelAxis == -1 ? 1 : dims[curWeight.perChannelAxis];//3584
+                    k *= curWeight.group;                       //100352, k就是h*h/128=3584*3584/128的计算结果
+                    curWeight.perChannelsConfigs.resize(k);     //我们确定读取的数量为k，则预先分配好数组大小，防止反复分配 
                     curWeight.mins.resize(k);
                     curWeight.scales.resize(k);
                     for (int i = 0; i < k; i++) {
                         float minValue = buffer.ReadFloat();
                         float maxValue = buffer.ReadFloat();
+                        //LowBitConfig保存量化的信息，具体数值存在cpuData中, 未来可以通过invQuantization函数反量化
                         auto config = LowBitConfig(minValue, maxValue, bit, 1);
                         curWeight.perChannelsConfigs[i] = config;
+                        //mins和scales的数据其实都在config中, 这里我个人觉得有没有都无所谓，感觉有点占内存
                         curWeight.mins[i] = config.min;
                         curWeight.scales[i] = config.scale;
                     }
 #ifdef USE_MMAP
                     curWeight.cpuData = buffer.ReadBytes(curWeight.GetBytes());
 #else
+                    //将具体value读到cpuData成员中
+                    //这里要记得torch2file中我们将2个4bit数组合成一个Byte进行存储
                     buffer.ReadBytes(curWeight.cpuData, curWeight.GetBytes());
 #endif
                 }

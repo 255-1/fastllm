@@ -134,6 +134,7 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <std::vector <float>*> *logits = nullptr);
 
+        //在LaunchResponseToken函数使用
         virtual std::vector <int> ForwardBatch(
                 int batch,
                 const Data &inputIds,
@@ -167,6 +168,7 @@ namespace fastllm {
                                    RuntimeResultBatch retCb = nullptr,
                                    const GenerationConfig &generationConfig = GenerationConfig()); // 批量根据给出的内容回复 
 
+        //这个函数目前看下来是在python相关的功能里面调用，会使用第二个ForwardBatch
         virtual int LaunchResponseTokens(const std::vector <int> &inputTokens,
                                          const GenerationConfig &generationConfig = GenerationConfig()); // 启动一个response任务，返回分配的handleId
         
@@ -207,38 +209,39 @@ namespace fastllm {
 
         virtual std::vector <int> ApplyChatTemplateToTokens(const JinjaVar &var);
 
+        //下面这些属性都在torch2file中设置过
+        //模型类型
         std::string model_type;
         std::string model_struct;
-
+        //torch2file中的参数设置过
         std::string pre_prompt; // 最初对话的提示语
         std::string user_role, bot_role, history_sep; // 用于生成每一轮的prompt
 
-        int bos_token_id;
-        int eos_token_id;
-        std::set <int> eos_token_ids;
-        int embed_dim = 4096;
-        int num_attention_heads = 32;
-        int head_dim = embed_dim / num_attention_heads;
-        int max_positions = 32768;
-        int rotary_dim = 64;
-        const float scale_attn = sqrt(head_dim);
-        int block_cnt = 28;
-
-        std::vector<std::vector<float> > sin, cos;
-
+        int bos_token_id; //开始的token id，特殊token
+        int eos_token_id; //结束的token id, 特殊token
+        std::set <int> eos_token_ids; // 多个eos_token_ids;
+        int embed_dim = 4096;   //变量维度
+        int num_attention_heads = 32; //注意力头数量
+        int head_dim = embed_dim / num_attention_heads; //每个注意力头的维度
+        int max_positions = 32768; //最大位置编码
+        int rotary_dim = 64;    //旋转位置编码维度
+        const float scale_attn = sqrt(head_dim); //多头注意力公式的系数，sqrt(d/h)
+        int block_cnt = 28; //Transformer块数
         WeightMap weight; // 权重
+        std::string adapterName = "";
 
-        Data sinData, cosData;
+        //下面这些成员变量不在flm中的
+        std::vector<std::vector<float> > sin, cos; //位置编码
 
-        ResponseContextDict responseContextDict;
+        Data sinData, cosData; //位置编码数据
+
+        ResponseContextDict responseContextDict; //用于生成response token的上下文
 
         std::thread *mainLoop = nullptr;
         std::mutex mainLoopLocker, dictLocker;
         std::condition_variable dictCV;
 
         std::map <std::string, int> deviceMap;
-
-        std::string adapterName;
 
         int tokensLimit = -1;
         int promptLimit = -1;

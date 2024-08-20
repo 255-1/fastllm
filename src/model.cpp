@@ -58,12 +58,12 @@ namespace fastllm {
             ErrorInFastLLM("ConvertDataType Failed. (" + std::to_string(srcDtype) + " -> " + std::to_string(dstDtype) + ")");
         }
     }
-
+    //读取flm文件，主要读取权重并且初始化参数
     void basellm::LoadFromFile(const std::string &fileName) {
         this->weight.LoadFromFile(fileName);
         this->InitParams();
     }
-
+    //初始化模型参数, 没什么花头，就是把modelInfo中的东西赋值到成员变量中
     void basellm::InitParams() {
         if (this->weight.dicts.find("bos_token_id") != this->weight.dicts.end()) {
             if (this->weight.dicts["bos_token_id"]!="None") {
@@ -112,6 +112,7 @@ namespace fastllm {
         }
         if (this->weight.dicts.find("tokenizer_add_dummy_prefix") != this->weight.dicts.end()) {
             std::string value = this->weight.dicts["tokenizer_add_dummy_prefix"];
+            //转成小写
             transform(value.begin(), value.end(), value.begin(), ::tolower);
             std::istringstream iss(value);
             iss >> std::boolalpha >> this->weight.tokenizer.addDummyPrefix;
@@ -128,7 +129,7 @@ namespace fastllm {
             std::istringstream iss(value);
             iss >> std::boolalpha >> this->weight.tokenizer.byteAsChar;
         }
-
+        //这个deviceMap在推理时把具体算子分配到显卡或者cpu
         this->deviceMap = GetDeviceMap();
     }
 
@@ -149,7 +150,8 @@ namespace fastllm {
         }
         this->weight.SaveLowBitModel(fileName, 0);
     }
-
+    //model.cpp
+    //根据modelType创建对应的模型，并且返回一个父类basellm指针
     fastllm::basellm *CreateModelWithType(const std::string &modelType) {
         basellm *model = nullptr;
         if (modelType == "chatglm") {
@@ -179,6 +181,9 @@ namespace fastllm {
         } else if (modelType == "deepseek_v2") {
             model = (basellm*)(new DeepSeekV2Model());
         } else if (modelType == "qwen2") {
+            //qwen2实际生成一个Llama模型
+            //我们可以看到qwen2，llama，baichuan，internlm都是生成一个LlamaModel,
+            //这样学会一个LlamaModel相当于学会了4个模型
             model = new LlamaModel();
             model->model_type = "qwen";
         } else if (modelType=="minicpm") {
@@ -206,11 +211,20 @@ namespace fastllm {
         return std::unique_ptr<fastllm::BertModel> (model);
     }
 
+    //model.cpp
+    //读取flm文件
     std::unique_ptr<fastllm::basellm> CreateLLMModelFromFile(const std::string &fileName) {
+        //得到模型类型，读取modelInfo，{属性名：值}在这个字典中找model_type对应的值，这里是qwen2
         std::string modelType = GetModelTypeFromFile(fileName);
+        //根据模型类型创建模型
         basellm *model = CreateModelWithType(modelType);
+        //读取flm文件数据
         model->LoadFromFile(fileName);
+        //WarmUp初始化流程，WarmUp在llm训练中一般是为了让模型训练稳定不出现Nan，
+        //推理中使用WarmUp一般是为了预热显卡，同一个算子可能底层实现有很多，比如普通的实现，align优化的实现等等
+        //需要运行时确认使用哪一个对应算子，WarmUp让显卡加载需要的kernel算子,如果没有WarmUp，这些工作就由生成第一个token完成，会很慢
         model->WarmUp();
+        //返回模型
         return std::unique_ptr<fastllm::basellm> (model);
     }
 

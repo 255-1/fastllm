@@ -11,6 +11,7 @@
 #include <iostream>
 
 namespace fastllm {
+    //Llama模型继承自basllm
     class LlamaModel: public basellm {
     public:
         LlamaModel (); // 构造函数
@@ -27,6 +28,7 @@ namespace fastllm {
                 const LastTokensManager &lastTokens = LastTokensManager(),
                 std::vector <float> *logits = nullptr);
 
+        //Batch推理，Forward是ForwarBatch的batch=1的特殊情况
         std::vector <int> ForwardBatch(
                 int batch,
                 const Data &inputIds,
@@ -64,6 +66,7 @@ namespace fastllm {
 
         std::pair<std::vector<float>, std::vector<float>> UpdateRotaryPosEmb(float base, float factor, int seqLen = 0); // 更新位置编码
 
+    //LlamaModel特有的一些模型参数
     protected:
         RoPEType rope_type = RoPEType::BASE;
 

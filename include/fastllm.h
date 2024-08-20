@@ -238,7 +238,12 @@ namespace fastllm {
         int unitSize, unitSizeDiv = 1; // 单个元素的字节数 = unitSIze / unitSizeDiv
 
         std::vector <int> dims; // 数据形状
-        std::vector <uint64_t> strides; // 跨度
+        //跨度, 权重数据在底层就是一个int[]数组，必须要有方法快速定位需要的元素
+        //比如在二维矩阵[h,h]中，对应的stride就是[h, 1]
+        //其中1代表列之间（第1维度）间隔元素数量，每次对数组指针+1就可以得到下一个元素的位置
+        //h代表行之间（第0维度）间隔元素的数量，比如第二行的第一个元素，我可以通过ptr+strides[0]直接得到
+        //这样，想得到a行b列向量，就可以通过ptr + a * strides[0] + b *stride[1]得到，更到维度可以类推
+        std::vector <uint64_t> strides; 
 
         uint64_t expansionSize = 0; // 扩容后的尺寸
         uint64_t expansionBytes = 0; // 扩容后的字节数
@@ -255,7 +260,7 @@ namespace fastllm {
         DataDevice dataDevice = DataDevice::CPU;
         std::vector <int> dataDeviceIds;
 
-        // 以下参数用于量化，对FLOAT数据不适用
+        // 以下参数用于int4g量化，对FLOAT数据不适用
         int perChannelAxis = -1; // 沿哪个轴分通道量化，-1代表没有分通道
         int group = -1, groupCnt = -1; // 分组量化，group代表组数，groupCnt代表每组有多少个元素，-1代表不使用分组量化
 
