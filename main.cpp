@@ -147,8 +147,8 @@ int main(int argc, char **argv) {
         if (input == "stop") {
             break;
         }
+        //input: Python写一个快排函数
         messages.push_back(std::make_pair("user", input));
-        //回复
         std::string ret = model->Response(model->ApplyChatTemplate(messages), [](int index, const char* content) {
             if (index == 0) {
                 printf("%s:%s", modelType.c_str(), content);

@@ -163,17 +163,28 @@ namespace fastllm {
         return ret;
     }
 
+
+    //batch=1时的回复
+    //oriInput: 包含了所有历史问答内容
+    //retCb：lambda函数，用于输出回复内容
+    //generationConfig: 模型配置信息
     std::string basellm::Response(const std::string &oriInput, RuntimeResult retCb,
                                   const fastllm::GenerationConfig &generationConfig) {
         std::string input = oriInput;
-        if (this->saveHistoryChat) {
+        //如果设置了保存历史Token
+        if (this->saveHistoryChat) {        
             if (lastKeyValues != nullptr) {
+                //input包含了历史的所有问答
                 if (input.size() < lastPrompt.size() || (input.substr(0, lastPrompt.size()) != lastPrompt)) {
-                    lastPrompt = "";
-                    lastPromptTokens = 0;
+                    //特殊情况
+                    //清空lastPrompt
+                    lastPrompt = "";        //lastPrompt存储了所有历史的input和回答字符串
+                    lastPromptTokens = 0;   //lastPromptTokens是数量
                     delete lastKeyValues;
                     lastKeyValues = nullptr;
                 } else {
+                    //一般情况
+                    //本次用户的输入
                     input = input.substr(lastPrompt.size());
                 }
             }
@@ -184,27 +195,20 @@ namespace fastllm {
             lastKeyValues = nullptr;
         }
 
-        //printf("lastPrompt = %s\n", lastPrompt.c_str());
-        //printf("input = %s\n", input.c_str());
-
-#ifdef USE_CUDA
-        FastllmCudaClearBigBuffer();
-#endif
+        //input代表用户本次的输入
         std::string prompt = input;
-#ifdef PY_API
-        size_t pos = input.rfind("time_stamp:");
-        prompt = (generationConfig.enable_hash_id && pos != -1) ? input.substr(0, pos) : input;
-        size_t hash_id = std::hash<std::string>{}(input);
-#endif
         Data inputIds, attentionMask, positionIds;
-
+        //word -> tokenid
         Data inputTokenData = this->weight.tokenizer.Encode(prompt);
+        //这里第一个vector代表batch，第二个vector代表inputToken
+        //但是Response只处理batch=1的情况
+        //所以后面都是用inputTokens[0]表达Response
         std::vector<std::vector<float> > inputTokens;
         inputTokens.resize(1);
         for (int i = 0; i < inputTokenData.Count(0); i++) {
             inputTokens[0].push_back(((float *) inputTokenData.cpuData)[i]);
         }
-        
+        //初始化KV Cache, 第一个Data是Key， 第二个Data是Value
         if (lastKeyValues == nullptr) {
             lastKeyValues = new std::vector<std::pair<Data, Data> >();
             for (int i = 0; i < block_cnt; i++) {
@@ -216,17 +220,18 @@ namespace fastllm {
 
         std::vector<std::pair<Data, Data> > &pastKeyValues = (*lastKeyValues);
         std::string retString = "";
-        std::vector<float> results;
-        LastTokensManager tokens(1, generationConfig.last_n);
-        int promptLen = lastPromptTokens + inputTokens[0].size(), index = 0;
-        int add_special_tokens = generationConfig.add_special_tokens? 1: 0;
+        std::vector<float> results; //当前回答的token id序列
+        LastTokensManager tokens(1, generationConfig.last_n); //管理token，1代表batch大小， last_n代表存储多少个之前的token
+        int promptLen = lastPromptTokens + inputTokens[0].size(), index = 0; //promptLen 是历史问答长度+当前输入的
+        int add_special_tokens = generationConfig.add_special_tokens? 1: 0; //没用到
         FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
                       inputIds, attentionMask, positionIds);
         ToDataType(attentionMask, this->dataType);
         while (true) {
             auto st = std::chrono::system_clock::now();
-            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);        
-            tokens.units[0].Push(ret);
+            int ret = Forward(inputIds, attentionMask, positionIds, pastKeyValues, generationConfig, tokens);    //一次推理输出一个token id    
+            tokens.units[0].Push(ret); //batch大小为1，所以只要units[0]
+            //如果返回的是eos结束循环
             if (ret == eos_token_id
                 || generationConfig.stop_token_ids.find(ret) != generationConfig.stop_token_ids.end()
                 || eos_token_ids.find(ret) != eos_token_ids.end()) {
@@ -235,7 +240,7 @@ namespace fastllm {
 
             results.push_back(ret);
             std::string curString = weight.tokenizer.Decode(
-                    Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str();
+                    Data(DataType::FLOAT32, {(int) results.size()}, results)).c_str(); //解码，token id-> word
             retString += curString;
             if (retCb)
 #ifdef PY_API
@@ -251,11 +256,13 @@ namespace fastllm {
 #else
                 retCb(index, curString.c_str());
 #endif
-            index++;
+            index++; //记录输出数量用               
             fflush(stdout);
             results.clear();
-
-            inputTokens[0] = std::vector<float> {(float)ret};
+            //目前只输出了一个token
+            //接着输出下一个token的准备
+            //把ret作为下一个输入，进行自回归
+            inputTokens[0] = std::vector<float> {(float)ret};            
             FillLLMInputs(inputTokens, {{"promptLen", promptLen}, {"index", index}, {"add_special_tokens", add_special_tokens}},
                           inputIds, attentionMask, positionIds);
             ToDataType(attentionMask, this->dataType);
@@ -278,7 +285,7 @@ namespace fastllm {
 #else
             retCb(-1, retString.c_str());
 #endif
-
+        //更新lastPrompt，包含所有输入和问答
         lastPrompt += (input + retString);
         lastPromptTokens = promptLen + index;
         return retString;
@@ -968,16 +975,26 @@ printf("len = %d, spend = %f s. tokens / s = %f\n", (int)total, spend, (float)to
 
         int index = params.find("index")->second;
         int promptLen = params.find("promptLen")->second;
-
+        //WarmUp做区别
         if (inputTokens[0].size() > 1) {
             int seqLen = inputTokens[0].size();
+            //vpids负责位置编号，从0开始递增
             std::vector <float> vpids = std::vector <float> (seqLen, 0);
             for (int i = 0; i < seqLen; i++) {
                 vpids[i] = promptLen - seqLen + i;
             }
+
+            //将input和位置编码转换成Data类
+            //维度都是[1, seqLen]
             inputIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, inputTokens[0]));
             positionIds.CopyFrom(Data(DataType::FLOAT32, {1, seqLen}, vpids));
             
+            //如果需要上mask，其实是必须mask，没有例外
+            //mask只能看到当前以及历史内容，不能看到之后的内容
+            //promtLen >= seqLen, 这个矩阵是对角线以上为1
+            // 0 1 1 1 1 1
+            // 0 0 1 1 1 1
+            // 0 0 0 1 1 1
             if (NeedAttentionMask(seqLen, promptLen)) {
                 std::vector <float> vmask = std::vector <float> (seqLen * promptLen, 0);
                 for (int i = 0; i < seqLen; i++) {

@@ -76,10 +76,18 @@ namespace fastllm {
         return this->devices[0]->CanRun(opType, datas, floatParams, intParams);
     }
 
+    //执行器
+    //opType：算子名字
+    //datas：一般包含input, weight, output三个东西
+    //floatParams: 额外的float类型变量
+    //intParams: 额外的int类型变量
+    //datas的类型DataDict为了不Copy Data数据是一个{string, Data*}类型
     void Executor::Run(const std::string &opType, const fastllm::DataDict &datas, const fastllm::FloatDict &floatParams,
                        const fastllm::IntDict &intParams) {
+         //用于记录每个算子运行耗时
         auto st = std::chrono::system_clock::now();
         bool lockInCPU = false;
+        //遍历datas参数，确保这些数据是否要锁在CPU
         for (auto &it: datas) {
             if (intParams.find(it.first + "___batch") != intParams.end()) {
                 int batch = intParams.find(it.first + "___batch")->second;
@@ -90,10 +98,17 @@ namespace fastllm {
                 lockInCPU |= (it.second && it.second->lockInCPU);
             }
         }
+        //遍历可用设备，一般是1个CPU + 1个GPU
         for (auto device: devices) {
+            //如果需要锁在CPU中，就跳过GPU
             if (lockInCPU && device->deviceType != "cpu") {
                 continue;
             }
+            //cpudevice.cpp, cudadevice.cpp分别负责cpu和cuda算子实现
+            //每个算子都有三个函数，分别是
+            //CanRun: 当前设备可不可以跑这个算子
+            //Reshape: 用于判断输入的变量维度是否符合要求，并且给output Data分配空间
+            //Run：具体的算子实现
             if (device->CanRun(opType, datas, floatParams, intParams)) {
 #ifdef USE_CUDA
                 if (device->deviceType == "cuda" && device->deviceIds.size() > 0) {
@@ -103,6 +118,7 @@ namespace fastllm {
                     FastllmMultiCudaSetDevice(device->deviceIds);
                 }
 #endif
+                //如果当强device CanRun就把数据转移到对应的device上
                 for (auto &it: datas) {
                     if (intParams.find(it.first + "___batch") != intParams.end()) {
                         int batch = intParams.find(it.first + "___batch")->second;
@@ -117,11 +133,14 @@ namespace fastllm {
                         }
                     }
                 }
+                //Reshape: 用于判断输入的变量维度是否符合要求，并且推导output型状
                 device->Reshape(opType, datas, floatParams, intParams);
+                //运行算子
                 device->Run(opType, datas, floatParams, intParams);
                 break;
             }
         }
+        //记录算子的运行时间
         float spend = GetSpan(st, std::chrono::system_clock::now());
         profiler[opType] += spend;
     }

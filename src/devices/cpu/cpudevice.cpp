@@ -675,7 +675,9 @@ namespace fastllm {
             values.resize(group);
 
             int block = 0;
+            //block就是 batch * seqLen的和
             for (; block < n; block++) {
+                //下面最重要的变量就是weightWalk和inputWalk做遍历
                 uint8_t *weightWalk = b;
                 uint8_t *inputStart = a + block * m;
 
@@ -683,7 +685,7 @@ namespace fastllm {
                     std::fill(values.begin(), values.end(), 0.0f);
                     uint8_t *inputWalk = inputStart;
                     float sum = 0.0;
-
+                    //我们用int4就要处处考虑group的分组
                     for (int g = 0; g < group; g++) {
                         int st = g * groupCnt, end = std::min(m, (g + 1) * groupCnt);
                         float &value = values[g];
@@ -720,6 +722,7 @@ namespace fastllm {
                         value += DotU4U8(weightWalk + (i * m + st) / 2, inputWalk + st, end - st);
                         j += (end - st);
 #endif
+                        //INT4当时我们共用了1个字节
                         for (; j + 1 < end; j += 2) {
                             int id = (i * m + j) / 2;
                             value += (weightWalk[id] >> 4) * inputWalk[j];
@@ -748,6 +751,9 @@ namespace fastllm {
                     }
                     sum += vSum[0] + vSum[1] + vSum[2] + vSum[3];
 #endif
+                    //说实话我完全绕不明白下面这个代码的含义
+                    //我只能说这段代码在做反量化求和的操作
+                    //具体细节完全不清楚，可能依靠某种公式完成的
                     for (; g < group; g++) {
                         int iid = block * group + g;
                         int gid = i * group + g;
@@ -762,7 +768,7 @@ namespace fastllm {
                         int gid = i * group + group - 1;
                         sum += weightMins[gid] * izeros[iid] * (group * groupCnt - m) * iscales[iid];
                     }
-
+                    //最后给c加上bias
                     ((float*)c)[block * kstride + i] = sum + (bias == nullptr ? 0.0 : bias[i]);
                 }
             }
@@ -1068,35 +1074,48 @@ namespace fastllm {
             memcpy(cur, old, oldCache.dims[1] * oldCache.dims[2] * unitSize);
         }
     }
-
+    //cpudevice.cpp
+    //Embedding层的Reshape函数
     void CpuEmbedding::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        //input: tokenIds [batch, seqLen]
+        //weight: 训练过的词表特征矩阵 [vocab, h]
+        //output：输出序列, 输出每个tokenId的特征: [batch, seqLen, h]
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
 
+        //词表特征矩阵要符合以下两点
+        //1）维度为2
+        //2）float32或者bf16类型，embedding数据一般都不做量化
+        //输入数据也要是float32/16类型
         AssertInFastLLM(weight.dims.size() == 2, "Embedding's weight's dim should be 2.\n");
         AssertInFastLLM(weight.dataType == DataType::FLOAT32 ||
                         weight.dataType == DataType::BFLOAT16, "Embedding's weight's type should be float32 or bfloat16.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, 
                         "Embedding's input's type should be float32 or float16.\n");
-
+        //词表特征矩阵类型为EMBEDDING
         weight.weightType = WeightType::EMBEDDING;
+        //这三步确定了output维度在input的基础上多了一个h大小的维度
         int vocabSize = weight.dims[0], embSize = weight.dims[1];
         std::vector <int> dims = input.dims;
         dims.push_back(embSize);
-
+        //output定义和分配空间相关的变量，但还没有分配内存
+        //真要分配在Run的实现
         output.dataType = input.dataType;
         output.Resize(dims);
     }
 
+    //cpudevice.cpp
+    //Embedding层的Run函数
     void CpuEmbedding::Run(const std::string &opType, const fastllm::DataDict &datas,
                                const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        //要提取的参数还是这三个，和之前的区别是output定义了分配大小
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);;
-
+        //给output分配空间
         output.Allocate();
 
         int vocabSize = weight.dims[0], embSize = weight.dims[1];
@@ -1105,13 +1124,14 @@ namespace fastllm {
         float *inputData = (float*)input.cpuData;
         float *dstOutputData = (float*)output.cpuData;
 
+        //如果输入类型不是float32而是bf16
         std::vector <float> tempInputData, tempOutputData;
         if (input.dataType != DataType::FLOAT32) {
             tempInputData.resize(inputLen);
             tempOutputData.resize(inputLen * embSize);
             inputData = tempInputData.data();
             dstOutputData = tempOutputData.data();
-
+            //转成float32
             if (input.dataType == DataType::FLOAT16) {
                 for (int i = 0; i < inputLen; i++) {
                     inputData[i] = half_to_float(((uint16_t*)input.cpuData)[i]);
@@ -1120,12 +1140,14 @@ namespace fastllm {
                 ErrorInFastLLM("Embedding error: unsupport dataType.\n");
             }
         }
-
+        //低内存空间，所有数据都在文件中
         if (GetLowMemMode()) {
             FILE *fi = fopen(weight.fileName.c_str(), "rb");
             if (weight.dataType == DataType::FLOAT32) {
+                //float32
                 float *outputData = (float *) dstOutputData;
                 for (int i = 0; i < inputLen; i++) {
+                    //对给个token，都用fseek定位，然后fread到output中
                     int token = (int) (inputData[i] + 1e-9);
 #if defined(_WIN32) or defined(_WIN64)
                     _fseeki64(fi, (long long)token * embSize * sizeof(float) + weight.filePos, 0);
@@ -1135,6 +1157,7 @@ namespace fastllm {
                     int ret = fread(outputData + i * embSize, sizeof(float), embSize, fi);
                 }
             } else {
+                //bf16
                 uint16_t *outputData = (uint16_t *) dstOutputData;
                 uint16_t *weightData = new uint16_t[embSize];
                 for (int i = 0; i < inputLen; i++) {
@@ -1154,19 +1177,26 @@ namespace fastllm {
             }
             fclose(fi);
         } else {
+            //正常内存模式
             if (weight.dataType == DataType::FLOAT32) {
+                //weight权重为float32
                 float *outputData = (float *) dstOutputData;
                 float *weightData = (float *) weight.cpuData;
                 for (int i = 0; i < inputLen; i++) {
                     int token = (int) (inputData[i] + 1e-9);
+                    //找到第token行的特征然后cpy到output中
                     memcpy(outputData + i * embSize, weightData + token * embSize, embSize * sizeof(float));
                 }
             } else {
+                //weight权重是bf16类型
                 uint16_t *outputData = (uint16_t *) dstOutputData;
                 uint16_t *weightData = (uint16_t *) weight.cpuData;
                 for (int i = 0; i < inputLen; i++) {
                     int token = (int) (inputData[i] + 1e-9);
                     for (int j = 0; j < embSize; j++) {
+                        //output还是存放4B而不是2B
+                        //高字节赋值为0
+                        //低字节赋值为weightData
                         outputData[i * embSize * 2 + j * 2] = 0;
                         outputData[i * embSize * 2 + j * 2 + 1] = weightData[token * embSize + j];
                     }
@@ -1424,18 +1454,25 @@ namespace fastllm {
         }
     }
 
+    //Linear算子的维度推导
     void CpuLinearOp::Reshape(const std::string &opType, const fastllm::DataDict &datas,
                               const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        //input * weight = output
+        //[batch, seqLen, h] * [h, h]^T = [batch, seqLen, h]
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
 
+        //矩阵乘法规则
+        //这里可以看出input的0维和weight的1维对应，
+        //Linear其实是对weight看作转置后的
         AssertInFastLLM(weight.dims.size() == 2, "Linear's weight's shape's size should be 2.\n");
         AssertInFastLLM(input.dims.back() == weight.dims[1], "Linear's weight's shape error.\n");
-
+        
+        //确认维度然后resize
         weight.weightType = WeightType::LINEAR;
         std::vector <int> dims = input.dims;
-        dims.back() = weight.dims[0];
+        dims.back() = weight.dims[0]; //一些特殊情况，比如mergeQKV的weight可能是[3h,h]
 
         output.dataType = input.dataType;
         output.Resize(dims);
@@ -2109,11 +2146,18 @@ namespace fastllm {
             pool->PushOp(startTid + i, ops[startTid + i]);
         }
     }
-
-    //a = [n, m], b = [k, m], c = aT(b') = [n, k]
+    //cpudevice. cpp
+    //a * b^T + bias = c
     void MultiplyInt4GroupMultiThread(uint8_t *a, uint8_t *b, int32_t *c, int n, int m, int k,
                                  int *weightSums, float *weightMins, float *scales, float *bias,
                                  std::vector <LowBitConfig> &configs, int threadNum, int group, int groupCnt) {
+        //a: 已经合并了batch和seqLen的二维input
+        //b: 权重矩阵
+        //c: 输出矩阵
+        //n, m, k：之前计算的参数
+
+        //下面这个for很怪
+        //相当于做了一个没有优化过的weightSum
         std::vector <float> inputSums;
         for (int i = 0; i < n; i++) {
             for (int g = 0; g < group; g++) {
@@ -2124,6 +2168,7 @@ namespace fastllm {
                 inputSums.push_back(sum);
             }
         }
+        //input的scales和zeros
         std::vector <float> iscales, izeros;
         for (int i = 0; i < configs.size(); i++) {
             iscales.push_back(configs[i].scale);
@@ -2143,6 +2188,10 @@ namespace fastllm {
             std::vector<fastllm::MultiThreadLinearInt4GroupOp*> ops;
             for (int i = 0; i < threadNum; i++) {
                 int end = (i == threadNum - 1 ? k : cur + per + (cur + per * (threadNum - i) < k));
+                //将矩阵分块，多线程计算Linear结果
+                //看似有很多参数，只要抓住a, b, c三个矩阵就能看懂这个函数在干吗
+                //a 保持不变 假设维度为[a, b]
+                //b 被分割m / 2, 代表的意思就是对半切
                 ops.push_back(new MultiThreadLinearInt4GroupOp(a, b + cur * m / 2, c + cur, n, m, end - cur, k,
                                                weightSums + cur * group, weightMins + cur * group, scales + cur * group,
                                                (bias == nullptr ? (float *) nullptr : bias + cur), iscales.data(), izeros.data(),
@@ -2261,15 +2310,22 @@ namespace fastllm {
         return true;
     }
 
+    //Linear CPU算子实现
     void CpuLinearOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-//auto st = std::chrono::system_clock::now();
+        //多了bias变量，之前的resize用不用它不影响维度推理
+        //input * weight = output
+        //[batch, seqLen, h] * [h, h]^T + [h]= [batch, seqLen, h]
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
         Data &weight = *(datas.find("weight")->second);
         Data &bias = *(datas.find("bias")->second);
 
         output.Allocate(0.0f);
+        //input有三个维度 [batch, seqLen, h]
+        //n代表了除了最后的h意外的其他总和
+        //m代表特征维度大小
+        //n, m将三个维度看作两个维度，这样可以和矩阵权重的二维相乘
         int n = input.Count(0) / input.dims.back();
         int m = input.dims.back();
         int k = output.dims.back();
@@ -2522,18 +2578,26 @@ namespace fastllm {
                 weight.CalcWeightSum();
 
                 std::vector<LowBitConfig> inputConfigs;
+                //对输入进行INT4G量化
+                //别看是三个for循环，其实依旧是遍历权重数组
+                //只是中间分出来一层group分组， 其实还是正常遍历
                 for (int i = 0; i < n; i++) {
                     for (int g = 0; g < group; g++) {
                         int st = g * groupCnt;
                         int end = std::min(m, (g + 1) * groupCnt);
                         float minValue = 1e9, maxValue = -1e9;
                         for (int j = st; j < end; j++) {
+                            //我们可以看到，定位信息依旧是i和j
+                            //第二个for循环的group只是人为分离出来
                             minValue = std::min(minValue, inputData[i * m + j]);
                             maxValue = std::max(maxValue, inputData[i * m + j]);
                         }
                         inputConfigs.push_back(LowBitConfig(minValue, maxValue, 8, 0));
                     }
                 }
+                //上面负责计算，scale，min，max信息
+                //下面负责进行量化
+                //uinput用于存储input量化后的数据[0,16]
                 std::vector<uint8_t> uinput;
                 uinput.resize(n * m);
                 for (int i = 0; i < n; i++) {
@@ -2543,6 +2607,8 @@ namespace fastllm {
                 }
 
 #ifdef __AVX__
+                //这一段代码每次处理32字节的数据
+                //将每两个字节顺序颠倒，重新写回uinput中，可能是AVX的特性要求
                 uint8_t *temp = new uint8_t[32];
                 for (int i = 0; i < n; i++) {
                     for (int j = 0; j + 31 < m; j += 32) {
@@ -2555,7 +2621,7 @@ namespace fastllm {
                 }
                 delete[] temp;
 #endif
-
+                //多线程Linear运算
                 MultiplyInt4GroupMultiThread(uinput.data(), weightData, (int32_t *) outputData, n, m, k,
                                             weight.weightSum.data(), weight.mins.data(), weight.scales.data(),
                                             biasData, inputConfigs, GetThreads(), group, groupCnt);

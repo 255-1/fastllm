@@ -427,17 +427,38 @@ namespace fastllm {
 #ifdef USE_CUDA
             unitLen = 128;
 #endif
-            while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || k.dims[1] > pastKey.expansionDims[1]))
-                   || (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+            //KV Cache核心就是划一大块空间存储之前计算的K和V
+            //代码中就是pastKeyh和pastValue
+            //这一块空间大小由unitLen决定，在seqLen维度进行扩展
+            //常见的Data维度是[batch, seqLen, h]
+            //KV Cache在seqLenw维度扩展，预分配[batch, unitLen, h]
+
+            //expansion属性就是给KV Cache准备的，
+            //普通的Data类，就是数据占多少空间，Data就要多少空间
+            //但是KV Cache是预先要分配一大块空间，所以就要靠expansion
+            //pastKey.dims代表实际占用，pastKey.expansionDims代表分配大小
+
+            //这里的while循环其实就是保证pastKey能存下所有数据
+            //pastKey.dims[1]也就是pastKey的seqLen + k.dims[1]就是k的seqLen < pastKey的扩容维度
+            while ((pastKey.dims.size() == 0 && (pastKey.expansionDims.size() == 0 || 
+                    k.dims[1] > pastKey.expansionDims[1])) || 
+                    (pastKey.dims.size() > 0 && pastKey.dims[1] + k.dims[1] > pastKey.expansionDims[1])) {
+                //要扩容pastKey
                 std::vector <int> newDims;
                 if (pastKey.Count(0) == 0 || pastKey.dims.size() == 0) {
+                    //没有分配过KV Cache的扩容
+                    //可以看到这里主要修改的是第1维度
+                    //找到能放下的unitLen倍数
                     newDims = std::vector <int> {k.dims[0], ((k.dims[1] - 1) / unitLen + 1) * unitLen, k.dims[2]};
                 } else {
+                    //运行中的扩容
+                    //在原来的基础上修改第1维度
                     newDims = pastKey.dims;
                     newDims[1] += ((k.dims[1] - 1) / unitLen + 1) * unitLen;
                 }
                 pastKey.Expansion(newDims);
             }
+            //pastValue也一样
             while ((pastValue.dims.size() == 0 && (pastValue.expansionDims.size() == 0 || v.dims[1] > pastValue.expansionDims[1]))
                    || (pastValue.dims.size() > 0 && pastValue.dims[1] + v.dims[1] > pastValue.expansionDims[1])) {
                 std::vector <int> newDims;
@@ -450,8 +471,11 @@ namespace fastllm {
                 pastValue.Expansion(newDims);
             }
 
+
+            //将k矩阵cat到pastKey中
             CatDirect(pastKey, k, 1);
             CatDirect(pastValue, v, 1);
+            //随着推理一直进行，不断有新的kv cat到pastKey中，这样就有了历史信息
 
             //得到Q，K，V后正式开始Attention计算
             //qwen2没有alibiData，直接用Attention算子
@@ -556,17 +580,13 @@ namespace fastllm {
         } else {
             lastHiddenStates = &hiddenStates;
         }
-        //函数返回的结果，长度为batch，每个元素是每个batch预测的下一个token id
+
         std::vector <int> lastRet;
         {
-            //预测前的RMS, hiddenStates: [batch, seqLen, h]
+            auto &hiddenStates = *lastHiddenStates;
             RMSNorm(hiddenStates, weight["model.norm.weight"], rms_norm_eps, hiddenStates);
-            //logits代表在单词中的预测概率
-            //hiddenStates * W = logits
-            //[batch, seqLen, h] * [vocab, h]^T = [batch, seqLen, vocab]
             Linear(hiddenStates, weight["lm_head.weight"], Data(), logits);
             ToDataType(logits, DataType::FLOAT32);
-            //这里是retLogits参数登场，如果config里面需要打印logits，就存入
             if (generationConfig.output_logits && retLogits != nullptr) {
                 int size = logits.dims.back();
                 logits.ToDevice(DataDevice::CPU);
@@ -577,22 +597,17 @@ namespace fastllm {
                         size * logits.unitSize);
                 }
             }
-            //判断是不是贪心算法，所谓贪心算法就是top_k=1，没有repeat_penalty
-            //这种算法能保证速度快，但是质量很一般，因为候选单词只选择一个
+
             if (generationConfig.IsSimpleGreedy()) {
-                //选择最好的1个
                 TopK(logits, topk, 1);
                 topk.ToDevice(DataDevice::CPU);
-                //存入返回结果
                 for (int b = 0; b < batch; b++) {
                     int base = b;
                     lastRet.push_back((int) (((float *) topk.cpuData)[base * 2] + 1e-3));
                 }
             } else {
-                //非贪心算法，有参数设置
                 for (int b = 0; b < batch; b++) {
                     int base = b * logits.dims[1] + logits.dims[1] - 1;
-                    //通过LLMSampling筛选出预测结果
                     lastRet.push_back(LLMSampling(logits, base, generationConfig, lastTokens.units[b]));
                 }
             }
@@ -1128,12 +1143,14 @@ namespace fastllm {
         return (round == 0 ? pre_prompt : history) + user_role + input + bot_role + output + history_sep;
     }
 
+    //llama.cpp
     void LlamaModel::WarmUp() {
         printf("Warmup...\n");
+        //inputIds就是1，所有参数都可以硬编码写
         Data inputIds = Data(DataType::FLOAT32, {1, 1}, {1});
         Data attentionMask = Data(DataType::FLOAT32, {1, 1}, {0});
         Data positionIds = Data(DataType::FLOAT32, {1, 1}, {0, 0});
-
+        //初始化KV Cache, WarmUp结束也就没了
         std::vector <std::pair <Data, Data> > pastKeyValues;
         for (int i = 0; i < block_cnt; i++) {
             pastKeyValues.push_back(std::make_pair(Data(DataType::FLOAT32),
@@ -1143,10 +1160,8 @@ namespace fastllm {
             this->weight["lm_head.weight"] = Data();
             this->weight["lm_head.weight"].CopyFrom(this->weight["model.embed_tokens.weight"]);
         }
+        //做一次推理预热显卡
         Forward(inputIds, attentionMask, positionIds, pastKeyValues);
-        elementsInKVCachePerToken = (long long)block_cnt * 
-            (pastKeyValues[0].first.dims[0] * pastKeyValues[0].first.dims[2] + 
-             pastKeyValues[0].second.dims[0] * pastKeyValues[0].second.dims[2]);
         printf("finish.\n");
     }
 }

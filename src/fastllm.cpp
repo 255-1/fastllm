@@ -649,7 +649,11 @@ namespace fastllm {
         return this->dims[i] * this->strides[i];
     }
 
+    //更新每一个元素的大小
     void Data::UpdateUnitSize() {
+        //unitSize代表字节数
+        //对于小于1个字节的，还进一步细分unitSizeDiv，计算占1个字节的比例
+        //比如INT4占字节为1/2
         if (this->dataType == DataType::FLOAT32) {
             this->unitSize = 4;
             this->unitSizeDiv = 1;
@@ -679,11 +683,20 @@ namespace fastllm {
 
         this->expansionBytes = (this->expansionSize * this->unitSize - 1) / this->unitSizeDiv + 1;
     }
+    
 
+    //fastllm.cpp
+    //Data重新分配空间
     void Data::Resize(const std::vector<int> &dims) {
+        //更新维度以及元素大小
         this->dims = dims;
         this->UpdateUnitSize();
-
+        //更新stride
+        //所有Data成员的数据在底层就是一维int[]数组存储，必须要有方法快速定位需要的元素
+        //比如在二维矩阵[h,h]中，对应的stride就是[h, 1]
+        //其中1代表列之间（第1维度）间隔元素数量，每次对数组指针+1就可以得到下一个元素的位置
+        //h代表行之间（第0维度）间隔元素的数量，比如第二行的第一个元素，我可以通过ptr+strides[0]直接得到
+        //这样，想得到a行b列向量，就可以通过ptr + a * strides[0] + b *stride[1]得到，高维度可以类推
         if (this->expansionDims.size() == 0) {
             this->strides.resize(dims.size(), 1);
             this->strides.back() = 1;
@@ -730,10 +743,19 @@ namespace fastllm {
         return (this->strides[0] * this->dims[0] * this->unitSize - 1) / this->unitSizeDiv + 1;
     }
 
+    //分配空间
+    //size就是元素数量
     void Data::MallocSpace(uint64_t size) {
         this->expansionSize = size;
+        //具体分配大小
+        //这个公式的作用让分配空间能向上取整
+        //假设有一个3 * 7的INT4(unitSize=1, unitSizeDiv=2)矩阵
+        //所占空间就是3 * 7 / 2 = 10.5字节
+        //用下面的公式： (3 * 7 -1)/2 + 1 = 11 就可以存下全部数据
         this->expansionBytes = (size * this->unitSize - 1) / this->unitSizeDiv + 1;
         if (this->dataDevice == DataDevice::CPU) {
+            //分配一个int[]数组
+            //fastllm的所有量化函数都是映射到正整数上，所以可以用无符号uint8
             this->cpuData = new uint8_t[this->expansionBytes];
             memset(this->cpuData, 0, this->expansionBytes*sizeof(uint8_t));
         } else if (this->dataDevice == DataDevice::CUDA) {
@@ -749,10 +771,12 @@ namespace fastllm {
         }
     }
 
+    //释放空间
     void Data::FreeSpace() {
         this->expansionSize = 0;
         this->expansionBytes = 0;
         if (this->dataDevice == DataDevice::CPU) {
+            //cpuData就是个int[]数组
             delete[] this->cpuData;
         } else if (this->dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
@@ -768,7 +792,13 @@ namespace fastllm {
     }
 
     void Data::Allocate() {
+        //Count(0)就是计算矩阵一共有多少个元素
+        //对于绝大多数的Data，其实用不到expansionSize
+        //都是有多少元素占多少大小，一次分配就完成了
+        //expansionSize主要用于KV Cache
+        //因为Cache总要多分配一些空间，并且会越来越大
         if (!isFake && Count(0) > expansionSize) {
+            //先释放现有空间，然后重新分配
             FreeSpace();
             MallocSpace(Count(0));
         }
@@ -1043,7 +1073,7 @@ namespace fastllm {
                 }
             }
         } else if (this->dataType == DataType::INT4_GROUP) {
-            weightSum.resize(n * this->group);
+            weightSum.resize(n * this->group);  //h *h /128
             for (int i = 0; i < n; i++) {
                 for (int g = 0; g < this->group; g++) {
                     int gid = i * this->group + g;
@@ -1363,7 +1393,7 @@ namespace fastllm {
     }
 
     std::string Tokenizer::Normalize(const std::string &ori) {
-        if (this->byteAsChar) {
+        if (this->byteAsChar) { //qwen2使用byteAsChar，将ori全部转换成wstring
             std::wstring ws(ori.size(), L' ');
             for (int i=0; i < ori.length(); i++) {
                 wchar_t wi = static_cast<wchar_t>(static_cast<unsigned char>(ori[i]));
@@ -1395,7 +1425,7 @@ namespace fastllm {
     bool isDigitOrChar(char c) {
         return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
     }
-
+    //将输入的字符串编码成token id
     Data Tokenizer::Encode(const std::string &ori) {
         if (this->type == TokenizerType::BPE) {
             std::string s = Normalize(ori);
